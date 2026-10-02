@@ -1,0 +1,99 @@
+name: cppcheck
+title: Cppcheck
+summary: Static analysis for C and C++ that finds undefined behavior, out-of-bounds access and leaks, with the Python addons and HTML reports.
+homepage: https://cppcheck.sourceforge.io/
+# Cppcheck (GPL-3.0-or-later) and the libraries it bundles and compiles in:
+# tinyxml2 (Zlib), picojson (BSD-2-Clause) and simplecpp (0BSD).
+license: GPL-3.0-or-later AND Zlib AND BSD-2-Clause AND 0BSD
+source-release: true
+upstream:
+  source: github-tag
+  repository: cppcheck-opensource/cppcheck
+  # Release tags look like 2.22.0. Some patch releases, such as 2.21.1, are
+  # only tagged, with no GitHub release. The "2." outside the group limits
+  # the tag lookup to tags that start with it. Old two-part tags (2.11) and
+  # release candidates (2.13.3-rc4) do not match, and neither would a
+  # 3.0.0: widen the pattern then.
+  tag-pattern: '^2\.(\d+\.\d+)$'
+  version-template: '2.{1}'
+  versioning: semver
+  version: 2.22.0
+  # Cppcheck publishes only a Windows installer, so the build clones the tag.
+  git:
+    url: https://github.com/cppcheck-opensource/cppcheck.git
+    tag: '{version}'
+    commit: a436ca35ed1887bee789765122b65ed2d7a7e045
+image:
+  entrypoint: [cppcheck]
+  cmd: [--help]
+test:
+  - |
+    cppcheck --version > version.txt
+    test "$(cat version.txt)" = "Cppcheck $VERSION" || { echo "expected Cppcheck $VERSION, got: $(cat version.txt)" >&2; exit 1; }
+    cppcheck --filesdir > filesdir.txt
+    test "$(cat filesdir.txt)" = /usr/local/share/cppcheck || { echo "unexpected FILESDIR: $(cat filesdir.txt)" >&2; exit 1; }
+    command -v cppcheck-htmlreport > /dev/null || { echo 'cppcheck-htmlreport is missing' >&2; exit 1; }
+  - |
+    # memleak needs the allocation functions from cfg/std.cfg.
+    printf '%s\n' \
+      '#include <stdlib.h>' \
+      '' \
+      'void out_of_bounds(void)' \
+      '{' \
+      '    int a[10];' \
+      '    a[10] = 0;' \
+      '}' \
+      '' \
+      'void leak(void)' \
+      '{' \
+      '    char *p = malloc(10);' \
+      '}' > sample.c
+    status=0
+    cppcheck --enable=warning --template='{id}' --error-exitcode=3 sample.c > sample.log 2> ids.txt || status=$?
+    if [ "$status" -ne 3 ]; then
+      echo "expected exit status 3, got $status" >&2
+      cat sample.log ids.txt >&2
+      exit 1
+    fi
+    for id in arrayIndexOutOfBounds memleak; do
+      grep -qx "$id" ids.txt || { echo "expected $id in:" >&2; cat ids.txt >&2; exit 1; }
+    done
+  - |
+    # avr8 is read from platforms/avr8.xml; its int has 16 bits.
+    printf '%s\n' '#include <unistd.h>' '' 'int main(void)' '{' '    return (int) getpid() & 1;' '}' > posix.c
+    cppcheck --library=posix --platform=avr8 --dump --error-exitcode=1 posix.c > posix.log 2>&1 \
+      || { cat posix.log >&2; exit 1; }
+    grep -Fq 'int_bit="16"' posix.c.dump || { echo 'expected int_bit="16" in the dump:' >&2; grep -F '<platform' posix.c.dump >&2; exit 1; }
+  - |
+    # Addons are Python scripts that cppcheck runs with python3 from PATH.
+    printf '%s\n' 'long widen(int x)' '{' '    return (long) x;' '}' > cast.c
+    cppcheck --addon=findcasts --enable=all --template='{id}' cast.c > cast.log 2> cast-ids.txt \
+      || { cat cast.log cast-ids.txt >&2; exit 1; }
+    grep -qx 'findcasts-cast' cast-ids.txt || { echo 'expected findcasts-cast in:' >&2; cat cast-ids.txt >&2; exit 1; }
+  - |
+    cppcheck --enable=warning --xml sample.c > /dev/null 2> r.xml
+    grep -Fq 'id="arrayIndexOutOfBounds"' r.xml || { cat r.xml >&2; exit 1; }
+    cppcheck-htmlreport --file=r.xml --report-dir=html --source-dir=. > html.log 2>&1 || { cat html.log >&2; exit 1; }
+    grep -Fq arrayIndexOutOfBounds html/index.html || { echo 'html/index.html does not list arrayIndexOutOfBounds' >&2; exit 1; }
+    # The numbered page for sample.c holds its source, highlighted by Pygments.
+    grep -lF out_of_bounds html/[0-9]*.html > pages.txt || { echo 'no HTML page shows sample.c' >&2; ls html >&2; exit 1; }
+  - |
+    mkdir b
+    cppcheck --cppcheck-build-dir=b -j 2 sample.c > b.log 2>&1 || { cat b.log >&2; exit 1; }
+    test -n "$(ls -A b)" || { echo 'cppcheck wrote nothing to the build directory' >&2; cat b.log >&2; exit 1; }
+  - |
+    # Rules need PCRE 1, which Ubuntu 26.04 no longer ships, so neither image has them.
+    if cppcheck --rule=foo sample.c > rule.log 2>&1; then
+      echo 'cppcheck accepted --rule' >&2
+      exit 1
+    fi
+    grep -Fq 'has not been built with rules support' rule.log || { cat rule.log >&2; exit 1; }
+examples:
+  - title: Check the sources in src for bugs and style issues, failing on any finding
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/cppcheck --enable=warning,style --error-exitcode=1 src
+  - title: Check C code against MISRA C 2012 with the misra addon
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/cppcheck --addon=misra src
+  - title: Check a CMake project from its compile_commands.json on all CPU cores
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:$PWD" -w "$PWD" ghcr.io/randomcontainers/cppcheck --project=build/compile_commands.json -j "$(nproc)"
+  - title: Write the results as XML and turn them into an HTML report in html/
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint sh ghcr.io/randomcontainers/cppcheck -c 'cppcheck --enable=warning,style --xml src 2> report.xml && cppcheck-htmlreport --file=report.xml --report-dir=html --source-dir=.'
