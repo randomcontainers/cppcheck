@@ -1,0 +1,118 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+RUN apk add --no-cache \
+      build-base \
+      ca-certificates \
+      cmake \
+      git \
+      python3 \
+      samurai \
+      scanelf
+
+# Cppcheck releases only a Windows installer, so the release tag is cloned and
+# must point to the commit pinned in package.yml.
+ARG VERSION
+ARG SOURCE_COMMIT
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "${VERSION}" \
+      https://github.com/cppcheck-opensource/cppcheck.git /src/cppcheck; \
+    test "$(git -C /src/cppcheck rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag ${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }
+WORKDIR /src/cppcheck
+ARG JOBS
+# The match compiler, which upstream recommends for release builds, turns the
+# Token::Match patterns into C++ with python3 at build time; the check after
+# the build fails if it was skipped. Rules (--rule) need PCRE 1, which Ubuntu
+# 26.04 no longer has, and are left out on both distros so that the images
+# behave the same. tinyxml2 is the bundled copy. FILESDIR is compiled in as the
+# directory with cfg/, platforms/ and addons/. DISABLE_DMAKE stops the build
+# from regenerating upstream's Makefile. musl has no execinfo.h, so CMake turns
+# off the backtrace that cppcheck prints when it crashes. musl gives new
+# threads 128 KiB of stack, too little for cppcheck's recursive analysis with
+# --executor=thread; -z stack-size raises the default to glibc's 8 MiB.
+RUN set -- \
+      -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DFILESDIR=/usr/local/share/cppcheck \
+      -DUSE_MATCHCOMPILER=On \
+      -DHAVE_RULES=OFF \
+      -DUSE_BOOST=Off \
+      -DUSE_BUNDLED_TINYXML2=ON \
+      -DBUILD_GUI=OFF \
+      -DBUILD_TESTING=OFF \
+      -DDISABLE_DMAKE=ON \
+      -DCMAKE_EXE_LINKER_FLAGS=-Wl,-z,stack-size=8388608; \
+    echo "$*" > /tmp/cmake-options; \
+    cmake -S . -B build "$@" | tee /tmp/cmake.log; \
+    cmake --build build -j"${JOBS:-$(nproc)}"; \
+    test -f build/lib/build/mc_tokenize.cpp || { echo "the match compiler did not run" >&2; exit 1; }; \
+    DESTDIR=/out cmake --install build --strip; \
+    out=/out/usr/local; \
+    "$out/bin/cppcheck" --version > /tmp/cppcheck-version; \
+    grep -Fqx "Cppcheck ${VERSION}" /tmp/cppcheck-version || { cat /tmp/cppcheck-version >&2; exit 1; }; \
+    test "$("$out/bin/cppcheck" --filesdir)" = /usr/local/share/cppcheck \
+      || { echo "cppcheck was built with another FILESDIR" >&2; exit 1; }; \
+    for f in cfg/std.cfg cfg/posix.cfg platforms/avr8.xml addons/cppcheckdata.py addons/misra.py; do \
+      test -f "$out/share/cppcheck/$f" || { echo "missing: /usr/local/share/cppcheck/$f" >&2; exit 1; }; \
+    done; \
+    test -x "$out/bin/cppcheck-htmlreport"; \
+    stack="$(readelf -lW "$out/bin/cppcheck" | awk '$1 == "GNU_STACK" { print $6 }')"; \
+    test "$stack" = 0x800000 || { echo "unexpected GNU_STACK size: $stack" >&2; exit 1; }
+
+ARG BASE_IMAGE
+# simplecpp, tinyxml2 and picojson are compiled in and keep their licenses in
+# externals/. runtime-deps lists the so: names cppcheck needs, plus the
+# packages in runtime-deps.alpine: python3 runs the addons and
+# cppcheck-htmlreport, which also needs Pygments.
+RUN --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra \
+    meta=/out/usr/local/share/randomcontainers/cppcheck; \
+    mkdir -p "$meta/licenses"; \
+    cp COPYING "$meta/licenses/COPYING"; \
+    for lib in picojson simplecpp tinyxml2; do \
+      cp "externals/$lib/LICENSE" "$meta/licenses/LICENSE.$lib"; \
+    done; \
+    for f in "$meta"/licenses/*; do test -s "$f"; done; \
+    grep -q 'GNU GENERAL PUBLIC LICENSE' "$meta/licenses/COPYING"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/cppcheck-opensource/cppcheck.git@${SOURCE_COMMIT}" \
+      "https://github.com/cppcheck-opensource/cppcheck/tree/${SOURCE_COMMIT}" \
+      "https://github.com/randomcontainers/cppcheck/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(c++ --version | sed -n 1p)"; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      echo "cmake: $(cat /tmp/cmake-options)"; \
+      grep -E '^-- (Build type|USE_MATCHCOMPILER_OPT|HAVE_RULES|USE_BOOST|USE_BUNDLED_TINYXML2|FILESDIR_DEF|HAVE_EXECINFO_H) +=' /tmp/cmake.log; \
+      cat /tmp/cppcheck-version; \
+    } > "$meta/buildinfo"; \
+    scanelf --needed --nobanner --format '%n#p' --recursive /out/usr/local | tr ',' '\n' | sort -u > /tmp/needed; \
+    while read -r so; do \
+      if [ -n "$so" ] && [ -z "$(find /out -name "$so" -print -quit)" ]; then echo "so:$so"; fi; \
+    done < /tmp/needed > /tmp/elf-deps; \
+    test -s /tmp/elf-deps; \
+    sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/cppcheck/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /tmp/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "cppcheck"]
+CMD ["--help"]
