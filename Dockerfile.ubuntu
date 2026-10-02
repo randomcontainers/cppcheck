@@ -1,0 +1,124 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+# The base image's packages are recorded before anything is installed, so that
+# runtime-deps can leave them out. Every image that installs runtime-deps is
+# built on the same base.
+RUN dpkg-query -W -f '${Package}\n' | LC_ALL=C sort -u > /tmp/base-packages; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      git \
+      ninja-build \
+      python3; \
+    rm -rf /var/lib/apt/lists/*
+
+# Cppcheck releases only a Windows installer, so the release tag is cloned and
+# must point to the commit pinned in package.yml.
+ARG VERSION
+ARG SOURCE_COMMIT
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "${VERSION}" \
+      https://github.com/cppcheck-opensource/cppcheck.git /src/cppcheck; \
+    test "$(git -C /src/cppcheck rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag ${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }
+WORKDIR /src/cppcheck
+ARG JOBS
+# The match compiler, which upstream recommends for release builds, turns the
+# Token::Match patterns into C++ with python3 at build time; the check after
+# the build fails if it was skipped. Rules (--rule) need PCRE 1, which Ubuntu
+# 26.04 no longer has, and are left out on both distros so that the images
+# behave the same. tinyxml2 is the bundled copy. FILESDIR is compiled in as the
+# directory with cfg/, platforms/ and addons/. DISABLE_DMAKE stops the build
+# from regenerating upstream's Makefile.
+RUN set -- \
+      -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DFILESDIR=/usr/local/share/cppcheck \
+      -DUSE_MATCHCOMPILER=On \
+      -DHAVE_RULES=OFF \
+      -DUSE_BOOST=Off \
+      -DUSE_BUNDLED_TINYXML2=ON \
+      -DBUILD_GUI=OFF \
+      -DBUILD_TESTING=OFF \
+      -DDISABLE_DMAKE=ON; \
+    echo "$*" > /tmp/cmake-options; \
+    cmake -S . -B build "$@" | tee /tmp/cmake.log; \
+    cmake --build build -j"${JOBS:-$(nproc)}"; \
+    test -f build/lib/build/mc_tokenize.cpp || { echo "the match compiler did not run" >&2; exit 1; }; \
+    DESTDIR=/out cmake --install build --strip; \
+    out=/out/usr/local; \
+    "$out/bin/cppcheck" --version > /tmp/cppcheck-version; \
+    grep -Fqx "Cppcheck ${VERSION}" /tmp/cppcheck-version || { cat /tmp/cppcheck-version >&2; exit 1; }; \
+    test "$("$out/bin/cppcheck" --filesdir)" = /usr/local/share/cppcheck \
+      || { echo "cppcheck was built with another FILESDIR" >&2; exit 1; }; \
+    for f in cfg/std.cfg cfg/posix.cfg platforms/avr8.xml addons/cppcheckdata.py addons/misra.py; do \
+      test -f "$out/share/cppcheck/$f" || { echo "missing: /usr/local/share/cppcheck/$f" >&2; exit 1; }; \
+    done; \
+    test -x "$out/bin/cppcheck-htmlreport"
+
+ARG BASE_IMAGE
+# simplecpp, tinyxml2 and picojson are compiled in and keep their licenses in
+# externals/. runtime-deps lists the packages that own the libraries cppcheck
+# loads, minus the base image's packages, plus the packages in
+# runtime-deps.ubuntu: python3 runs the addons and cppcheck-htmlreport, which
+# also needs Pygments.
+RUN --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    meta=/out/usr/local/share/randomcontainers/cppcheck; \
+    mkdir -p "$meta/licenses"; \
+    cp COPYING "$meta/licenses/COPYING"; \
+    for lib in picojson simplecpp tinyxml2; do \
+      cp "externals/$lib/LICENSE" "$meta/licenses/LICENSE.$lib"; \
+    done; \
+    for f in "$meta"/licenses/*; do test -s "$f"; done; \
+    grep -q 'GNU GENERAL PUBLIC LICENSE' "$meta/licenses/COPYING"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/cppcheck-opensource/cppcheck.git@${SOURCE_COMMIT}" \
+      "https://github.com/cppcheck-opensource/cppcheck/tree/${SOURCE_COMMIT}" \
+      "https://github.com/randomcontainers/cppcheck/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(c++ --version | sed -n 1p)"; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      echo "cmake: $(cat /tmp/cmake-options)"; \
+      grep -E '^-- (Build type|USE_MATCHCOMPILER_OPT|HAVE_RULES|USE_BOOST|USE_BUNDLED_TINYXML2|FILESDIR_DEF|HAVE_EXECINFO_H) +=' /tmp/cmake.log; \
+      cat /tmp/cppcheck-version; \
+    } > "$meta/buildinfo"; \
+    find /out/usr/local -type f \( -perm -u+x -o -name '*.so*' \) -print0 \
+      | xargs -0 env LD_LIBRARY_PATH=/out/usr/local/lib ldd > /tmp/ldd 2>&1 || true; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    awk '$2 == "=>" && $3 ~ /^\// && $3 !~ /^\/out\// { print $3 }' /tmp/ldd | sort -u > /tmp/libs; \
+    test -s /tmp/libs; \
+    while read -r lib; do \
+      real="$(readlink -f "$lib")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | LC_ALL=C sort -u | LC_ALL=C comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/cppcheck/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /tmp/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "cppcheck"]
+CMD ["--help"]
